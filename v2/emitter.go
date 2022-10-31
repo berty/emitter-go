@@ -4,12 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"go.uber.org/zap"
 )
 
 // Various emitter errors
@@ -29,6 +29,7 @@ type Message interface {
 // Client represents an emitter client which holds the connection.
 type Client struct {
 	sync.RWMutex
+	logger     *zap.Logger
 	guid       string              // Emiter's client ID
 	conn       mqtt.Client         // MQTT client
 	opts       *mqtt.ClientOptions // MQTT options
@@ -67,9 +68,9 @@ func NewClient(options ...func(*Client)) *Client {
 		timeout:  60 * time.Second,
 		store:    new(store),
 		handlers: NewTrie(),
+		logger:   zap.NewNop(),
 	}
 
-	// Set handlers
 	c.opts.SetOnConnectHandler(c.onConnect)
 	c.opts.SetConnectionLostHandler(c.onConnectionLost)
 	c.opts.SetDefaultPublishHandler(c.onMessage)
@@ -87,6 +88,13 @@ func NewClient(options ...func(*Client)) *Client {
 	// Create the underlying MQTT client and set the options
 	c.conn = mqtt.NewClient(c.opts)
 	return c
+}
+
+// WithLogger override logger
+func WithLogger(logger *zap.Logger) func(*Client) {
+	return func(c *Client) {
+		c.logger = logger
+	}
 }
 
 // OnMessage sets the MessageHandler that will be called when a message
@@ -124,14 +132,13 @@ func (c *Client) onConnectionLost(_ mqtt.Client, e error) {
 	if c.disconnect != nil {
 		c.disconnect(c, e)
 	} else {
-		log.Println("emitter: connection lost, due to", e.Error())
+		c.logger.Debug("emitter: connection lost, due to", zap.Error(e))
 	}
 }
 
 // OnError will set the function callback to be executed if an emitter-specific
 // error occurs.
 func (c *Client) OnError(handler ErrorHandler) {
-
 	c.errors = handler
 }
 
@@ -161,18 +168,18 @@ func (c *Client) onMessage(_ mqtt.Client, m mqtt.Message) {
 	case c.presence != nil && strings.HasPrefix(m.Topic(), "emitter/presence/"):
 		var msg presenceMessage
 		if err := json.Unmarshal(m.Payload(), &msg); err != nil {
-			log.Println("emitter:", err.Error())
+			c.logger.Error("unable to unmarshall", zap.Error(err))
 		}
 
 		r := PresenceEvent{msg, make([]PresenceInfo, 0)}
 		if msg.Event == "status" {
 			if err := json.Unmarshal([]byte(msg.Who), &r.Who); err != nil {
-				log.Println("emitter:", err.Error())
+				c.logger.Error("unable to unmarshall", zap.Error(err))
 			}
 		} else {
 			r.Who = append(r.Who, PresenceInfo{})
 			if err := json.Unmarshal([]byte(msg.Who), &r.Who[0]); err != nil {
-				log.Println("emitter:", err.Error())
+				c.logger.Error("unable to unmarshall", zap.Error(err))
 			}
 		}
 
@@ -223,11 +230,12 @@ func (c *Client) onResponse(m mqtt.Message, resp Response) bool {
 func (c *Client) onError(m mqtt.Message) {
 	var resp Error
 	if err := json.Unmarshal(m.Payload(), &resp); err != nil {
+		c.logger.Error("unable to umarshall", zap.Error(err))
 		return
 	}
 
 	if c.errors == nil {
-		log.Println("emitter:", resp.Error())
+		c.logger.Error("message error", zap.Int("status", resp.Status), zap.String("msg", resp.Message))
 	}
 
 	if c.errors != nil && !c.store.NotifyResponse(resp.RequestID(), &resp) {
@@ -252,10 +260,11 @@ func (c *Client) ID() string {
 	}
 
 	// Query the remote GUID, cast the response and store it
-	if resp, err := c.request("me", nil); err == nil {
-		if result, ok := resp.(*meResponse); ok {
-			c.guid = result.ID
-		}
+	resp, err := c.request("me", nil)
+	if err != nil {
+		c.logger.Error("unable to request", zap.Error(err))
+	} else if result, ok := resp.(*meResponse); ok {
+		c.guid = result.ID
 	}
 
 	return c.guid
